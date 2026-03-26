@@ -1,530 +1,463 @@
-<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>員工休假與打卡管理系統 (TG 全自動回報版)</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-        .calendar-day:disabled { cursor: not-allowed; opacity: 0.6; }
-        .vacation-active { background-color: #ef4444 !important; color: white !important; }
-        [v-cloak] { display: none; }
-    </style>
-</head>
-<body class="bg-gray-50 text-gray-900">
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInWithCustomToken, 
+  signInAnonymously, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  getDocs, 
+  onSnapshot, 
+  addDoc, 
+  serverTimestamp 
+} from 'firebase/firestore';
 
-    <div id="app" class="min-h-screen relative">
-        <!-- Toast 通知容器 -->
-        <div id="toast-container" class="fixed bottom-6 right-6 z-[200] flex flex-col gap-2 pointer-events-none"></div>
+// --- Firebase 初始化 ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' 
+  ? JSON.parse(__firebase_config) 
+  : { apiKey: "", authDomain: "", projectId: "", storageBucket: "", messagingSenderId: "", appId: "" };
 
-        <!-- 載入中遮罩 -->
-        <div id="loading-screen" class="fixed inset-0 bg-white flex items-center justify-center z-[100]">
-            <div class="text-center">
-                <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-black mx-auto mb-4"></div>
-                <p class="text-gray-500 text-sm">系統載入中...</p>
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'vacation-checkin-react-v1';
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+export default function App() {
+  // --- 狀態管理 ---
+  const [user, setUser] = useState(null);
+  const [currentUserData, setCurrentUserData] = useState(null);
+  const [employees, setEmployees] = useState([]);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [viewDate, setViewDate] = useState(new Date());
+  const [loading, setLoading] = useState(true);
+  const [toasts, setToasts] = useState([]);
+  const [currentTime, setCurrentTime] = useState(new Date());
+  
+  // 表單與彈窗狀態
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [showTgModal, setShowTgModal] = useState(false);
+  const [loginForm, setLoginForm] = useState({ account: '', password: '' });
+  const [newEmp, setNewEmp] = useState({ id: '', name: '', vacation: 7 });
+  const [tgConfig, setTgConfig] = useState({ 
+    token: '', 
+    chatId: '', 
+    autoEnabled: false, 
+    autoTime: '18:00', 
+    lastAutoSentDate: '' 
+  });
+
+  // --- 通用功能 ---
+  const showToast = (message, type = 'info') => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 3000);
+  };
+
+  const sendToTelegram = async (msg) => {
+    if (!tgConfig.token || !tgConfig.chatId) return false;
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${tgConfig.token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: tgConfig.chatId, text: msg, parse_mode: 'Markdown' })
+      });
+      const data = await res.json();
+      return data.ok;
+    } catch { return false; }
+  };
+
+  const processReport = async (isAuto = false) => {
+    const today = new Date().toLocaleDateString();
+    const checkinsRef = collection(db, 'artifacts', appId, 'public', 'data', 'checkins');
+    const snap = await getDocs(checkinsRef);
+    const todayLog = snap.docs.map(d => d.data()).filter(l => l.dateDisplay === today);
+    
+    const checkedIds = [...new Set(todayLog.map(l => l.employeeId))];
+    const missing = employees.filter(e => !checkedIds.includes(e.id));
+
+    let msg = `📊 *今日打卡總結報表*\n📅 日期：${today}\n`;
+    msg += `✅ 已打卡: ${checkedIds.length} 人\n❌ 未打卡: ${missing.length} 人\n`;
+    if (missing.length > 0) msg += `未打卡名單: ${missing.map(e => e.name).join(', ')}`;
+
+    const ok = await sendToTelegram(msg);
+    if (ok && isAuto) {
+      const newConfig = { ...tgConfig, lastAutoSentDate: today };
+      setTgConfig(newConfig);
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram'), { lastAutoSentDate: today }, { merge: true });
+    }
+    return ok;
+  };
+
+  // --- 副作用 (Auth & Data) ---
+  useEffect(() => {
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    // 監聽員工資料
+    const unsubEmp = onSnapshot(
+      collection(db, 'artifacts', appId, 'public', 'data', 'employees'), 
+      (snap) => {
+        setEmployees(snap.docs.map(d => ({ ...d.data(), id: d.id })));
+        setLoading(false);
+      },
+      (err) => console.error("Firestore Error:", err)
+    );
+
+    // 讀取 TG 設定
+    getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram')).then(snap => {
+      if (snap.exists()) setTgConfig(prev => ({ ...prev, ...snap.data() }));
+    });
+
+    return () => unsubEmp();
+  }, [user]);
+
+  // 計時器與自動報表
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = new Date();
+      setCurrentTime(now);
+      
+      // 自動報表檢查 (僅限管理員)
+      if (currentUserData?.id === 'ADMIN' && tgConfig.autoEnabled) {
+        const timeStr = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
+        const dateStr = now.toLocaleDateString();
+        if (timeStr >= tgConfig.autoTime && tgConfig.lastAutoSentDate !== dateStr) {
+          processReport(true);
+        }
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [currentUserData, tgConfig, employees]);
+
+  // --- 處理函式 ---
+  const handleLogin = () => {
+    const { account, password } = loginForm;
+    if (account === 'admin' && password === 'admin') {
+      setCurrentUserData({ id: 'ADMIN', name: '系統管理員' });
+      setIsLoggedIn(true);
+    } else {
+      const found = employees.find(e => e.id === account && e.id === password);
+      if (found) {
+        setCurrentUserData(found);
+        setIsLoggedIn(true);
+      } else {
+        showToast('登入失敗，請檢查工號與密碼', 'error');
+      }
+    }
+  };
+
+  const handleCheckin = async () => {
+    if (!isLoggedIn || currentUserData.id === 'ADMIN') return;
+    const now = new Date();
+    const d = now.toLocaleDateString();
+    const t = now.toLocaleTimeString();
+    
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'checkins'), {
+        employeeId: currentUserData.id,
+        employeeName: currentUserData.name,
+        dateDisplay: d,
+        timeDisplay: t,
+        timestamp: serverTimestamp()
+      });
+      showToast('打卡成功', 'success');
+      sendToTelegram(`🔔 *打卡通知*\n👤 ${currentUserData.name}\n⏰ ${d} ${t}`);
+    } catch (e) {
+      showToast('打卡失敗', 'error');
+    }
+  };
+
+  const toggleVacation = async (empId, dateStr) => {
+    const emp = employees.find(e => e.id === empId);
+    if (!emp) return;
+    const isAdmin = currentUserData?.id === 'ADMIN';
+    const isSelf = currentUserData?.id === empId;
+    if (!isAdmin && !isSelf) return;
+
+    const dates = emp.vacationDates || [];
+    const newDates = dates.includes(dateStr) 
+      ? dates.filter(d => d !== dateStr) 
+      : [...dates, dateStr];
+
+    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'employees', empId), { 
+      vacationDates: newDates, 
+      usedVacation: newDates.length 
+    }, { merge: true });
+  };
+
+  const saveEmployee = async () => {
+    if (!newEmp.id || !newEmp.name) return;
+    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'employees', newEmp.id), { 
+      id: newEmp.id, 
+      name: newEmp.name, 
+      totalVacation: parseInt(newEmp.vacation), 
+      vacationDates: [], 
+      usedVacation: 0 
+    });
+    setShowAddModal(false);
+    setNewEmp({ id: '', name: '', vacation: 7 });
+    showToast('員工新增成功', 'success');
+  };
+
+  const saveTgSettings = async () => {
+    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram'), tgConfig);
+    setShowTgModal(false);
+    showToast('Telegram 設定已儲存', 'success');
+  };
+
+  // --- 渲染組件 ---
+  if (loading) {
+    return (
+      <div className="fixed inset-0 bg-white flex items-center justify-center z-[100]">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-black mx-auto mb-4"></div>
+          <p className="text-gray-500 text-sm">系統載入中...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isLoggedIn) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
+        <div className="w-full max-w-sm bg-white border shadow-sm rounded-lg p-10">
+          <h1 className="text-2xl font-bold mb-6 text-center text-gray-800">員工登入</h1>
+          <div className="space-y-4">
+            <input 
+              className="w-full border p-3 rounded outline-none focus:ring-2 focus:ring-black/5" 
+              placeholder="工號 (管理員: admin)"
+              value={loginForm.account}
+              onChange={(e) => setLoginForm({...loginForm, account: e.target.value})}
+            />
+            <input 
+              className="w-full border p-3 rounded outline-none focus:ring-2 focus:ring-black/5" 
+              type="password" 
+              placeholder="密碼 (預設同工號)"
+              value={loginForm.password}
+              onChange={(e) => setLoginForm({...loginForm, password: e.target.value})}
+            />
+            <button 
+              onClick={handleLogin}
+              className="w-full bg-black text-white p-3 font-bold rounded hover:opacity-90 transition-opacity"
+            >
+              進入系統
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const isAdmin = currentUserData.id === 'ADMIN';
+  const year = viewDate.getFullYear();
+  const month = viewDate.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Toast */}
+      <div className="fixed bottom-6 right-6 z-[200] flex flex-col gap-2 pointer-events-none">
+        {toasts.map(t => (
+          <div key={t.id} className={`${t.type === 'success' ? 'bg-green-600' : t.type === 'error' ? 'bg-red-500' : 'bg-gray-800'} px-4 py-3 rounded-lg shadow-xl text-white text-sm font-medium animate-bounce`}>
+            {t.message}
+          </div>
+        ))}
+      </div>
+
+      {/* Header */}
+      <header 
+        onClick={handleCheckin}
+        className="w-full p-6 text-center border-b bg-white transition-all hover:bg-blue-50 cursor-pointer active:bg-blue-100 group"
+      >
+        <div className="text-xs text-gray-400 uppercase tracking-widest mb-1">System Time</div>
+        <div className="text-4xl font-mono font-bold group-hover:text-blue-600 transition-colors">
+          {currentTime.toLocaleString()}
+        </div>
+        {!isAdmin && (
+          <div className="text-sm text-blue-500 mt-2 font-medium flex items-center justify-center gap-2">
+            <span className="animate-pulse">👆</span> 點擊此區域立即打卡 (將自動回報至 TG)
+          </div>
+        )}
+      </header>
+
+      {/* Main Content */}
+      <main className="max-w-6xl mx-auto p-6">
+        <div className="flex flex-col md:flex-row justify-between items-center md:items-end mb-8 border-b pb-4 gap-4">
+          <div>
+            <p className="text-sm text-gray-500 font-medium bg-gray-100 px-3 py-1 rounded-full">
+              登入者: {currentUserData.name}
+            </p>
+          </div>
+          <div className="flex gap-4 items-center flex-wrap justify-center">
+            {isAdmin && (
+              <div className="flex gap-2 mr-4 border-r pr-4">
+                <button onClick={() => setShowTgModal(true)} className="text-sm border-gray-300 border px-3 py-1.5 rounded hover:bg-gray-100 flex items-center gap-1">
+                  ⚙️ TG 設定
+                </button>
+                <button onClick={() => processReport(false)} className="text-sm bg-[#0088cc] text-white px-3 py-1.5 rounded hover:bg-[#0077b3] flex items-center gap-1">
+                  📢 手動報表
+                </button>
+              </div>
+            )}
+            <div className="flex border rounded overflow-hidden bg-white shadow-sm">
+              <button onClick={() => setViewDate(new Date(year, month - 1))} className="px-3 py-1 hover:bg-gray-50">&lt;</button>
+              <div className="px-4 py-1 font-medium min-w-[120px] text-center">{year} / {month + 1}</div>
+              <button onClick={() => setViewDate(new Date(year, month + 1))} className="px-3 py-1 hover:bg-gray-50">&gt;</button>
             </div>
+            <button onClick={() => setIsLoggedIn(false)} className="text-sm font-bold text-red-500 hover:text-red-700 bg-red-50 px-3 py-1 rounded">登出</button>
+          </div>
         </div>
 
-        <!-- 頂部時間與打卡區 -->
-        <header id="header-checkin" class="w-full p-6 text-center border-b bg-white transition-all hover:bg-blue-50 cursor-pointer active:bg-blue-100 hidden group">
-            <div class="text-xs text-gray-400 uppercase tracking-widest mb-1">System Time</div>
-            <div id="current-time-display" class="text-4xl font-mono font-bold group-hover:text-blue-600 transition-colors">----/--/-- --:--:--</div>
-            <div id="checkin-hint" class="text-sm text-blue-500 mt-2 font-medium flex items-center justify-center gap-2">
-                <span class="animate-pulse">👆</span> 點擊此區域立即打卡 (將自動回報至 TG)
-            </div>
-            <div id="message-display" class="mt-3 text-green-600 font-bold hidden text-lg bg-green-50 inline-block px-4 py-1 rounded-full"></div>
-        </header>
-
-        <!-- 登入頁面 -->
-        <div id="login-section" class="p-10 max-w-sm mx-auto mt-20 bg-white border shadow-sm rounded-lg hidden">
-            <h1 class="text-2xl font-bold mb-6 text-center">員工登入</h1>
-            <div class="space-y-4">
-                <input id="login-account" class="w-full border p-3 rounded outline-none focus:ring-2 focus:ring-black/5" placeholder="工號 (管理員: admin)">
-                <input id="login-password" class="w-full border p-3 rounded outline-none focus:ring-2 focus:ring-black/5" type="password" placeholder="密碼 (管理員: admin)">
-                <button id="login-btn" class="w-full bg-black text-white p-3 font-bold rounded hover:opacity-90 transition-opacity">進入系統</button>
-            </div>
-        </div>
-
-        <!-- 主內容區域 -->
-        <main id="main-content" class="max-w-6xl mx-auto p-6 hidden">
-            <div class="flex flex-col md:flex-row justify-between items-center md:items-end mb-8 border-b pb-4 gap-4">
-                <div>
-                    <p id="user-info" class="text-sm text-gray-500 font-medium bg-gray-100 px-3 py-1 rounded-full"></p>
-                </div>
-                <div class="flex gap-4 items-center flex-wrap justify-center">
-                    <!-- 管理員專屬 Telegram 操作區 -->
-                    <div id="admin-tg-controls" class="flex gap-2 hidden mr-4 border-r pr-4">
-                        <button id="btn-tg-settings" class="text-sm border-gray-300 border px-3 py-1.5 rounded hover:bg-gray-100 transition-all flex items-center gap-1">
-                            <span>⚙️</span> TG 設定
-                        </button>
-                        <button id="btn-tg-send" class="text-sm bg-[#0088cc] text-white px-3 py-1.5 rounded hover:bg-[#0077b3] transition-all flex items-center gap-1 shadow-sm" title="手動發送總結報表">
-                            <span>📢</span> 總結報表
-                        </button>
-                    </div>
-
-                    <div class="flex border rounded overflow-hidden bg-white shadow-sm">
-                        <button id="prev-month" class="px-3 py-1 bg-white border-r hover:bg-gray-50 text-gray-600">&lt;</button>
-                        <div id="month-display" class="px-4 py-1 bg-white font-medium min-w-[120px] text-center">2024 / 1</div>
-                        <button id="next-month" class="px-3 py-1 bg-white border-l hover:bg-gray-50 text-gray-600">&gt;</button>
-                    </div>
-                    <button id="logout-btn" class="text-sm font-bold text-red-500 hover:text-red-700 transition-colors ml-2 bg-red-50 px-3 py-1 rounded">登出</button>
-                </div>
-            </div>
-
-            <div class="space-y-4">
-                <div class="flex justify-between items-center">
-                    <h2 class="text-lg font-bold">員工休假概況表</h2>
-                    <button id="add-employee-btn" class="text-sm border-black border px-4 py-1.5 rounded hover:bg-black hover:text-white transition-all hidden shadow-sm">
-                        + 新增員工
-                    </button>
-                </div>
-                
-                <div class="overflow-x-auto border bg-white rounded-lg shadow-sm">
-                    <table class="w-full text-left border-collapse min-w-[800px]">
-                        <thead class="bg-gray-50 text-xs text-gray-500 uppercase">
-                            <tr>
-                                <th class="p-4 border-b w-48 text-center">員工姓名 / 工號</th>
-                                <th class="p-4 border-b text-center w-32">已休 / 總額</th>
-                                <th class="p-4 border-b">本月休假預覽 (點擊日期可修改本人假別)</th>
-                            </tr>
-                        </thead>
-                        <tbody id="employee-table-body" class="divide-y text-sm">
-                            <!-- JS 動態渲染 -->
-                        </tbody>
-                    </table>
-                </div>
-                
-                <div id="user-tip" class="mt-4 p-4 bg-blue-50 text-blue-700 text-xs rounded-lg border border-blue-100 hidden">
-                    <strong>操作提示：</strong> 您可以在上方表格中找到您的姓名列，點擊對應日期方格即可直接申請或取消休假。
-                </div>
-            </div>
-        </main>
-
-        <!-- 新增員工彈窗 -->
-        <div id="modal-overlay" class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 hidden">
-            <div class="bg-white p-8 w-full max-w-md shadow-2xl rounded-lg mx-4">
-                <h3 class="text-xl font-bold mb-6">新增員工帳號</h3>
-                <div class="space-y-5">
-                    <div>
-                        <label class="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">工號</label>
-                        <input id="new-emp-id" class="w-full border rounded p-3 outline-none focus:border-black transition-colors" placeholder="帳號與密碼，例: EMP001">
-                    </div>
-                    <div>
-                        <label class="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">姓名</label>
-                        <input id="new-emp-name" class="w-full border rounded p-3 outline-none focus:border-black transition-colors" placeholder="顯示名稱，例: 王小明">
-                    </div>
-                    <div>
-                        <label class="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">年度特休天數</label>
-                        <input id="new-emp-vacation" class="w-full border rounded p-3 outline-none focus:border-black transition-colors" type="number" value="0">
-                    </div>
-                </div>
-                <div class="flex gap-3 mt-10">
-                    <button id="modal-cancel" class="flex-1 border p-3 text-sm font-bold rounded hover:bg-gray-50 transition-colors">取消</button>
-                    <button id="modal-save" class="flex-1 bg-black text-white p-3 text-sm font-bold rounded hover:bg-black/90 transition-colors">儲存資料</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Telegram 設定彈窗 -->
-        <div id="modal-tg-settings" class="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 hidden">
-            <div class="bg-white p-8 w-full max-w-md shadow-2xl rounded-lg mx-4 border-t-4 border-[#0088cc] max-h-[90vh] overflow-y-auto">
-                <div class="flex items-center gap-2 mb-6">
-                    <span class="text-2xl">⚙️</span>
-                    <h3 class="text-xl font-bold">Telegram 機器人設定</h3>
-                </div>
-                <div class="space-y-5">
-                    <div class="p-3 bg-blue-50 text-blue-800 text-xs rounded border border-blue-100">
-                        設定完成後，員工打卡將 <strong class="text-red-600">自動即時推播</strong>。您也可以啟用下方功能，在指定時間自動發送今日總結報表。
-                    </div>
-                    
-                    <div>
-                        <label class="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">Bot Token</label>
-                        <input id="tg-token" class="w-full border rounded p-3 outline-none focus:border-[#0088cc] transition-colors" placeholder="例: 123456789:ABCdefGhI...">
-                    </div>
-                    <div>
-                        <label class="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">Chat ID (群組或個人 ID)</label>
-                        <input id="tg-chatid" class="w-full border rounded p-3 outline-none focus:border-[#0088cc] transition-colors" placeholder="例: -100123456789">
-                    </div>
-
-                    <div class="border-t pt-4 mt-4">
-                        <label class="flex items-center gap-2 cursor-pointer mb-3">
-                            <input type="checkbox" id="tg-auto-enabled" class="w-4 h-4 text-[#0088cc] rounded focus:ring-[#0088cc]">
-                            <span class="text-sm font-bold">啟用每日自動傳送「總結報表」</span>
-                        </label>
-                        <div id="tg-auto-time-container" class="opacity-50 transition-opacity">
-                            <label class="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">自動發送時間</label>
-                            <input type="time" id="tg-auto-time" class="w-full border rounded p-3 outline-none focus:border-[#0088cc] transition-colors" value="18:00" disabled>
-                            <p class="text-[10px] text-gray-400 mt-1">⚠️ 提醒：時間到達時，管理員必須保持此網頁開啟才能觸發發送。</p>
+        <div className="space-y-4">
+          <div className="flex justify-between items-center">
+            <h2 className="text-lg font-bold">員工休假概況表</h2>
+            {isAdmin && (
+              <button onClick={() => setShowAddModal(true)} className="text-sm border-black border px-4 py-1.5 rounded hover:bg-black hover:text-white transition-all shadow-sm">
+                + 新增員工
+              </button>
+            )}
+          </div>
+          
+          <div className="overflow-x-auto border bg-white rounded-lg shadow-sm">
+            <table className="w-full text-left border-collapse min-w-[800px]">
+              <thead className="bg-gray-50 text-xs text-gray-500 uppercase">
+                <tr>
+                  <th className="p-4 border-b w-48">員工姓名 / 工號</th>
+                  <th className="p-4 border-b text-center w-32">已休 / 總額</th>
+                  <th className="p-4 border-b">本月休假預覽 (點擊日期可修改假別)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y text-sm">
+                {employees.map(emp => {
+                  const isSelf = emp.id === currentUserData.id;
+                  const canEdit = isAdmin || isSelf;
+                  return (
+                    <tr key={emp.id}>
+                      <td className="p-4 font-medium">{emp.name} <span className="text-xs text-gray-400">#{emp.id}</span></td>
+                      <td className="p-4 text-center">
+                        <span className={emp.usedVacation >= emp.totalVacation ? 'text-red-500 font-bold' : ''}>
+                          {emp.usedVacation || 0}
+                        </span> / {emp.totalVacation}
+                      </td>
+                      <td className="p-2">
+                        <div className="flex gap-1 overflow-x-auto p-1">
+                          {Array.from({ length: daysInMonth }, (_, i) => i + 1).map(day => {
+                            const dateStr = `${year}-${month + 1}-${day}`;
+                            const isLeaved = emp.vacationDates?.includes(dateStr);
+                            return (
+                              <button 
+                                key={day}
+                                onClick={() => toggleVacation(emp.id, dateStr)}
+                                disabled={!canEdit}
+                                className={`w-8 h-8 flex-shrink-0 text-[10px] rounded border transition-all 
+                                  ${isLeaved ? 'bg-red-500 text-white border-red-600' : 'bg-gray-50 hover:bg-gray-200'} 
+                                  ${!canEdit ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              >
+                                {day}
+                              </button>
+                            );
+                          })}
                         </div>
-                    </div>
-                </div>
-                
-                <div class="flex gap-3 mt-8">
-                    <button id="tg-modal-cancel" class="flex-1 border p-3 text-sm font-bold rounded hover:bg-gray-50 transition-colors">取消</button>
-                    <button id="tg-modal-save" class="flex-1 bg-[#0088cc] text-white p-3 text-sm font-bold rounded hover:bg-[#0077b3] transition-colors">儲存設定</button>
-                </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          
+          {!isAdmin && (
+            <div className="mt-4 p-4 bg-blue-50 text-blue-700 text-xs rounded-lg border border-blue-100">
+              <strong>操作提示：</strong> 您可以在上方表格中找到您的姓名列，點擊對應日期方格即可申請或取消休假。
             </div>
+          )}
         </div>
+      </main>
 
+      {/* Modals */}
+      {showAddModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white p-8 w-full max-w-md shadow-2xl rounded-lg">
+            <h3 className="text-xl font-bold mb-6">新增員工帳號</h3>
+            <div className="space-y-5">
+              <div>
+                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">工號</label>
+                <input value={newEmp.id} onChange={e => setNewEmp({...newEmp, id: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-black" placeholder="例: EMP001" />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">姓名</label>
+                <input value={newEmp.name} onChange={e => setNewEmp({...newEmp, name: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-black" placeholder="例: 王小明" />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">年度特休天數</label>
+                <input type="number" value={newEmp.vacation} onChange={e => setNewEmp({...newEmp, vacation: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-black" />
+              </div>
+            </div>
+            <div className="flex gap-3 mt-10">
+              <button onClick={() => setShowAddModal(false)} className="flex-1 border p-3 text-sm font-bold rounded hover:bg-gray-50">取消</button>
+              <button onClick={saveEmployee} className="flex-1 bg-black text-white p-3 text-sm font-bold rounded hover:bg-black/90">儲存資料</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showTgModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white p-8 w-full max-w-md shadow-2xl rounded-lg border-t-4 border-[#0088cc] max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center gap-2 mb-6">
+              <span className="text-2xl">⚙️</span>
+              <h3 className="text-xl font-bold">Telegram 機器人設定</h3>
+            </div>
+            <div className="space-y-5">
+              <div className="p-3 bg-blue-50 text-blue-800 text-xs rounded border border-blue-100">
+                打卡將自動即時推播。您也可以啟用自動報表功能。
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">Bot Token</label>
+                <input value={tgConfig.token} onChange={e => setTgConfig({...tgConfig, token: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-[#0088cc]" placeholder="12345678:AA..." />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">Chat ID</label>
+                <input value={tgConfig.chatid} onChange={e => setTgConfig({...tgConfig, chatId: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-[#0088cc]" placeholder="-100..." />
+              </div>
+              <div className="border-t pt-4 mt-4">
+                <label className="flex items-center gap-2 cursor-pointer mb-3">
+                  <input type="checkbox" checked={tgConfig.autoEnabled} onChange={e => setTgConfig({...tgConfig, autoEnabled: e.target.checked})} className="w-4 h-4 text-[#0088cc] rounded" />
+                  <span className="text-sm font-bold">啟用每日自動總結報表</span>
+                </label>
+                <div className={tgConfig.autoEnabled ? '' : 'opacity-50'}>
+                  <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">自動發送時間</label>
+                  <input type="time" disabled={!tgConfig.autoEnabled} value={tgConfig.autoTime} onChange={e => setTgConfig({...tgConfig, autoTime: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-[#0088cc]" />
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-3 mt-8">
+              <button onClick={() => setShowTgModal(false)} className="flex-1 border p-3 text-sm font-bold rounded hover:bg-gray-50">取消</button>
+              <button onClick={saveTgSettings} className="flex-1 bg-[#0088cc] text-white p-3 text-sm font-bold rounded hover:bg-[#0077b3]">儲存設定</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
-
-    <!-- Firebase SDK -->
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, addDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "", authDomain: "", projectId: "", storageBucket: "", messagingSenderId: "", appId: "" };
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'vacation-checkin-web-auto-tg';
-
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-
-        // 應用程式狀態
-        let state = {
-            user: null,
-            currentUserData: null,
-            employees: [],
-            viewDate: new Date(),
-            isLoggedIn: false,
-            telegramConfig: { 
-                token: '', 
-                chatId: '',
-                autoEnabled: false,
-                autoTime: '18:00',
-                lastAutoSentDate: '' 
-            }
-        };
-
-        const elements = {
-            loadingScreen: document.getElementById('loading-screen'),
-            loginSection: document.getElementById('login-section'),
-            mainContent: document.getElementById('main-content'),
-            headerCheckin: document.getElementById('header-checkin'),
-            timeDisplay: document.getElementById('current-time-display'),
-            messageDisplay: document.getElementById('message-display'),
-            userInfo: document.getElementById('user-info'),
-            monthDisplay: document.getElementById('month-display'),
-            tableBody: document.getElementById('employee-table-body'),
-            addBtn: document.getElementById('add-employee-btn'),
-            userTip: document.getElementById('user-tip'),
-            modal: document.getElementById('modal-overlay'),
-            checkinHint: document.getElementById('checkin-hint'),
-            adminTgControls: document.getElementById('admin-tg-controls'),
-            tgModal: document.getElementById('modal-tg-settings'),
-            btnTgSettings: document.getElementById('btn-tg-settings'),
-            btnTgSend: document.getElementById('btn-tg-send'),
-            tgInputToken: document.getElementById('tg-token'),
-            tgInputChatId: document.getElementById('tg-chatid'),
-            tgAutoEnabled: document.getElementById('tg-auto-enabled'),
-            tgAutoTime: document.getElementById('tg-auto-time'),
-            tgAutoTimeContainer: document.getElementById('tg-auto-time-container')
-        };
-
-        function showToast(message, type = 'info') {
-            const container = document.getElementById('toast-container');
-            const toast = document.createElement('div');
-            let bgClass = 'bg-gray-800';
-            let icon = 'ℹ️';
-            if (type === 'success') { bgClass = 'bg-green-600'; icon = '✅'; }
-            if (type === 'error') { bgClass = 'bg-red-500'; icon = '❌'; }
-            if (type === 'tg') { bgClass = 'bg-[#0088cc] shadow-[#0088cc]/30'; icon = '✈️'; }
-            toast.className = `transform transition-all duration-300 translate-y-4 opacity-0 flex items-center gap-3 px-4 py-3 rounded-lg shadow-xl text-white text-sm font-medium ${bgClass} pointer-events-auto`;
-            toast.innerHTML = `<span>${icon}</span> <span>${message}</span>`;
-            container.appendChild(toast);
-            requestAnimationFrame(() => toast.classList.remove('translate-y-4', 'opacity-0'));
-            setTimeout(() => {
-                toast.classList.add('translate-y-2', 'opacity-0');
-                setTimeout(() => toast.remove(), 300);
-            }, 3000);
-        }
-
-        async function sendToTelegram(messageText) {
-            if (!state.telegramConfig.token || !state.telegramConfig.chatId) return false;
-            const tgUrl = `https://api.telegram.org/bot${state.telegramConfig.token}/sendMessage`;
-            try {
-                const response = await fetch(tgUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: state.telegramConfig.chatId, text: messageText, parse_mode: 'Markdown' })
-                });
-                const tgData = await response.json();
-                return tgData.ok;
-            } catch (error) {
-                console.error("發送 TG 失敗:", error);
-                return false;
-            }
-        }
-
-        async function processAndSendSummaryReport(isAutoTrigger = false) {
-            if (!state.telegramConfig.token || !state.telegramConfig.chatId) return false;
-            try {
-                const todayStr = new Date().toLocaleDateString();
-                const checkinsRef = collection(db, 'artifacts', appId, 'public', 'data', 'checkins');
-                const checkinsSnap = await getDocs(checkinsRef);
-                const allCheckins = checkinsSnap.docs.map(d => d.data());
-                const todayCheckins = allCheckins.filter(c => c.dateDisplay === todayStr);
-                
-                const checkinMap = {};
-                todayCheckins.forEach(c => { checkinMap[c.employeeId] = { name: c.employeeName, time: c.timeDisplay }; });
-                const checkedInIds = Object.keys(checkinMap);
-                const missingEmployees = state.employees.filter(emp => !checkedInIds.includes(emp.id));
-
-                let message = `📊 *今日打卡總結報表* ${isAutoTrigger ? '(系統自動發送)' : ''}\n📅 日期：${todayStr}\n------------------------------\n`;
-                message += `✅ *已完成打卡 (${checkedInIds.length} 人)*：\n`;
-                if (checkedInIds.length > 0) {
-                    checkedInIds.forEach(id => { message += `  🔹 ${checkinMap[id].name} - \`${checkinMap[id].time}\`\n`; });
-                } else { message += `  (目前尚無人打卡)\n`; }
-                message += `\n❌ *未完成打卡 (${missingEmployees.length} 人)*：\n`;
-                if (missingEmployees.length > 0) {
-                    missingEmployees.forEach(emp => { message += `  🔸 ${emp.name} (#${emp.id})\n`; });
-                } else { message += `  🎉 所有人皆已打卡。\n`; }
-
-                const isSuccess = await sendToTelegram(message);
-                if (isSuccess && isAutoTrigger) {
-                    state.telegramConfig.lastAutoSentDate = todayStr;
-                    const tgDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram');
-                    await setDoc(tgDocRef, { lastAutoSentDate: todayStr }, { merge: true });
-                }
-                return isSuccess;
-            } catch (error) { return false; }
-        }
-
-        async function init() {
-            setInterval(() => {
-                const now = new Date();
-                elements.timeDisplay.innerText = `${now.toLocaleDateString()} ${now.toLocaleTimeString()}`;
-                if (state.currentUserData?.id === 'ADMIN' && state.telegramConfig.autoEnabled && state.telegramConfig.autoTime) {
-                    const currentHHMM = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
-                    const todayStr = now.toLocaleDateString();
-                    if (currentHHMM >= state.telegramConfig.autoTime && state.telegramConfig.lastAutoSentDate !== todayStr) {
-                        state.telegramConfig.lastAutoSentDate = todayStr; 
-                        processAndSendSummaryReport(true).then(success => {
-                            if (success) showToast('⏰ 時間到！已自動傳送總結報表', 'tg');
-                        });
-                    }
-                }
-            }, 1000);
-
-            const performAuth = async () => {
-                try {
-                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                        await signInWithCustomToken(auth, __initial_auth_token);
-                    } else { await signInAnonymously(auth); }
-                } catch (e) { elements.loadingScreen.classList.add('hidden'); }
-            };
-            performAuth();
-
-            onAuthStateChanged(auth, async (user) => {
-                state.user = user;
-                if (user) {
-                    setupFirestoreListeners();
-                    await loadTelegramSettings();
-                } else {
-                    elements.loginSection.classList.remove('hidden');
-                    elements.loadingScreen.classList.add('hidden');
-                }
-            });
-        }
-
-        let unsubscribeEmployees = null;
-        function setupFirestoreListeners() {
-            if (unsubscribeEmployees) unsubscribeEmployees();
-            const empRef = collection(db, 'artifacts', appId, 'public', 'data', 'employees');
-            unsubscribeEmployees = onSnapshot(empRef, (snap) => {
-                state.employees = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-                render();
-                elements.loadingScreen.classList.add('hidden');
-            }, (err) => { elements.loadingScreen.classList.add('hidden'); });
-        }
-
-        async function loadTelegramSettings() {
-            if (!state.user) return;
-            try {
-                const tgDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram');
-                const tgSnap = await getDoc(tgDocRef);
-                if (tgSnap.exists()) state.telegramConfig = { ...state.telegramConfig, ...tgSnap.data() };
-            } catch (e) { console.error("Load TG Error", e); }
-        }
-
-        document.getElementById('login-btn').onclick = async () => {
-            const acc = document.getElementById('login-account').value.trim();
-            const pass = document.getElementById('login-password').value.trim();
-            if (acc === 'admin' && pass === 'admin') {
-                state.currentUserData = { id: 'ADMIN', name: '系統管理員' };
-                state.isLoggedIn = true;
-                showToast('管理員登入成功', 'success');
-            } else {
-                const found = state.employees.find(e => e.id === acc && e.id === pass);
-                if (found) {
-                    state.currentUserData = found;
-                    state.isLoggedIn = true;
-                    showToast(`歡迎回來，${found.name}`, 'success');
-                } else {
-                    showToast('登入失敗，請檢查工號與密碼', 'error');
-                    return;
-                }
-            }
-            render();
-        };
-
-        document.getElementById('logout-btn').onclick = () => {
-            state.isLoggedIn = false;
-            state.currentUserData = null;
-            render();
-        };
-
-        elements.headerCheckin.onclick = async () => {
-            if (!state.isLoggedIn || state.currentUserData.id === 'ADMIN' || !state.user) {
-                if(state.currentUserData?.id === 'ADMIN') showToast('管理員無需打卡', 'info');
-                return;
-            }
-            try {
-                const now = new Date();
-                const dateStr = now.toLocaleDateString();
-                const timeStr = now.toLocaleTimeString();
-                const checkinRef = collection(db, 'artifacts', appId, 'public', 'data', 'checkins');
-                await addDoc(checkinRef, {
-                    employeeId: state.currentUserData.id,
-                    employeeName: state.currentUserData.name,
-                    timestamp: serverTimestamp(),
-                    dateDisplay: dateStr,
-                    timeDisplay: timeStr,
-                    uid: state.user.uid
-                });
-                elements.messageDisplay.innerText = `✅ 打卡成功！時間：${timeStr}`;
-                elements.messageDisplay.classList.remove('hidden');
-                setTimeout(() => elements.messageDisplay.classList.add('hidden'), 4000);
-                showToast(`打卡成功：${timeStr}`, 'success');
-                if (state.telegramConfig.token && state.telegramConfig.chatId) {
-                    const tgMessage = `🔔 *員工打卡通知*\n\n👤 *姓名：* ${state.currentUserData.name}\n⏰ *時間：* ${dateStr} ${timeStr}\n✅ *狀態：* 已成功打卡`;
-                    sendToTelegram(tgMessage).then(ok => ok && showToast('已自動推播至 TG', 'tg'));
-                }
-            } catch (e) { showToast('打卡失敗', 'error'); }
-        };
-
-        document.getElementById('add-employee-btn').onclick = () => elements.modal.classList.remove('hidden');
-        document.getElementById('modal-cancel').onclick = () => elements.modal.classList.add('hidden');
-        document.getElementById('modal-save').onclick = async () => {
-            const id = document.getElementById('new-emp-id').value.trim();
-            const name = document.getElementById('new-emp-name').value.trim();
-            const total = Number(document.getElementById('new-emp-vacation').value);
-            if (!id || !name) return showToast('請填寫完整資訊', 'error');
-            try {
-                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'employees', id);
-                await setDoc(docRef, { id, name, totalVacation: total, vacationDates: [], usedVacation: 0 }, { merge: true });
-                elements.modal.classList.add('hidden');
-                showToast(`已新增：${name}`, 'success');
-            } catch (e) { showToast('儲存失敗', 'error'); }
-        };
-
-        elements.btnTgSettings.onclick = () => {
-            elements.tgInputToken.value = state.telegramConfig.token || '';
-            elements.tgInputChatId.value = state.telegramConfig.chatId || '';
-            elements.tgAutoEnabled.checked = state.telegramConfig.autoEnabled || false;
-            elements.tgAutoTime.value = state.telegramConfig.autoTime || '18:00';
-            elements.tgAutoEnabled.dispatchEvent(new Event('change'));
-            elements.tgModal.classList.remove('hidden');
-        };
-
-        elements.tgAutoEnabled.onchange = (e) => {
-            elements.tgAutoTime.disabled = !e.target.checked;
-            elements.tgAutoTimeContainer.classList.toggle('opacity-50', !e.target.checked);
-        };
-
-        document.getElementById('tg-modal-cancel').onclick = () => elements.tgModal.classList.add('hidden');
-        document.getElementById('tg-modal-save').onclick = async () => {
-            state.telegramConfig = { ...state.telegramConfig, token: elements.tgInputToken.value.trim(), chatId: elements.tgInputChatId.value.trim(), autoEnabled: elements.tgAutoEnabled.checked, autoTime: elements.tgAutoTime.value };
-            try {
-                const tgDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram');
-                await setDoc(tgDocRef, state.telegramConfig);
-                elements.tgModal.classList.add('hidden');
-                showToast('設定已儲存', 'success');
-            } catch (e) { showToast('儲存失敗', 'error'); }
-        };
-
-        elements.btnTgSend.onclick = async () => {
-            elements.btnTgSend.disabled = true;
-            const success = await processAndSendSummaryReport(false);
-            if (success) showToast('報表已發送', 'tg');
-            elements.btnTgSend.disabled = false;
-        };
-
-        window.toggleVacation = async (empId, dateStr) => {
-            if (state.currentUserData.id !== 'ADMIN' && state.currentUserData.id !== empId) return;
-            const emp = state.employees.find(e => e.id === empId);
-            if (!emp) return;
-            const dates = emp.vacationDates || [];
-            const newDates = dates.includes(dateStr) ? dates.filter(d => d !== dateStr) : [...dates, dateStr];
-            try {
-                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'employees', empId);
-                await setDoc(docRef, { vacationDates: newDates, usedVacation: newDates.length }, { merge: true });
-            } catch (e) { showToast('操作失敗', 'error'); }
-        };
-
-        document.getElementById('prev-month').onclick = () => { state.viewDate = new Date(state.viewDate.getFullYear(), state.viewDate.getMonth() - 1, 1); render(); };
-        document.getElementById('next-month').onclick = () => { state.viewDate = new Date(state.viewDate.getFullYear(), state.viewDate.getMonth() + 1, 1); render(); };
-
-        function render() {
-            if (!state.isLoggedIn) {
-                elements.loginSection.classList.remove('hidden');
-                elements.mainContent.classList.add('hidden');
-                elements.headerCheckin.classList.add('hidden');
-                return;
-            }
-            elements.loginSection.classList.add('hidden');
-            elements.mainContent.classList.remove('hidden');
-            elements.headerCheckin.classList.remove('hidden');
-            elements.userInfo.innerText = `登入者: ${state.currentUserData.name} (${state.currentUserData.id})`;
-
-            if (state.currentUserData.id === 'ADMIN') {
-                elements.addBtn.classList.remove('hidden');
-                elements.adminTgControls.classList.remove('hidden');
-                elements.userTip.classList.add('hidden');
-            } else {
-                elements.addBtn.classList.add('hidden');
-                elements.adminTgControls.classList.add('hidden');
-                elements.userTip.classList.remove('hidden');
-            }
-
-            const year = state.viewDate.getFullYear();
-            const month = state.viewDate.getMonth();
-            elements.monthDisplay.innerText = `${year} / ${month + 1}`;
-            
-            const daysInMonth = new Date(year, month + 1, 0).getDate();
-            const dates = [];
-            for (let i = 1; i <= daysInMonth; i++) {
-                dates.push(`${year}-${(month + 1).toString().padStart(2, '0')}-${i.toString().padStart(2, '0')}`);
-            }
-
-            elements.tableBody.innerHTML = '';
-            state.employees.forEach(emp => {
-                const row = document.createElement('tr');
-                const isMe = state.currentUserData.id === emp.id || state.currentUserData.id === 'ADMIN';
-                
-                let calendarHtml = `<div class="flex flex-wrap gap-1 p-2">`;
-                dates.forEach(d => {
-                    const isActive = emp.vacationDates?.includes(d);
-                    const dayNum = d.split('-')[2];
-                    calendarHtml += `<button onclick="toggleVacation('${emp.id}', '${d}')" 
-                        class="w-8 h-8 text-[10px] rounded flex items-center justify-center transition-all ${isActive ? 'vacation-active' : 'bg-gray-100 hover:bg-gray-200'} ${!isMe ? 'cursor-not-allowed' : ''}" 
-                        ${!isMe ? 'disabled' : ''}>${dayNum}</button>`;
-                });
-                calendarHtml += `</div>`;
-
-                row.innerHTML = `
-                    <td class="p-4 text-center font-medium">${emp.name}<br><span class="text-[10px] text-gray-400">#${emp.id}</span></td>
-                    <td class="p-4 text-center"><span class="font-bold ${emp.usedVacation > emp.totalVacation ? 'text-red-500' : 'text-blue-600'}">${emp.usedVacation || 0}</span> / ${emp.totalVacation || 0}</td>
-                    <td class="p-2">${calendarHtml}</td>
-                `;
-                elements.tableBody.appendChild(row);
-            });
-        }
-
-        init();
-    </script>
-</body>
-</html>
+  );
+}
