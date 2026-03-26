@@ -1,38 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { initializeApp } from 'firebase/app';
-import { 
-  getAuth, 
-  signInWithCustomToken, 
-  signInAnonymously, 
-  onAuthStateChanged 
-} from 'firebase/auth';
-import { 
-  getFirestore, 
-  collection, 
-  doc, 
-  setDoc, 
-  getDoc, 
-  getDocs, 
-  onSnapshot, 
-  addDoc, 
-  serverTimestamp 
-} from 'firebase/firestore';
-
-// --- Firebase 初始化 ---
-const firebaseConfig = typeof __firebase_config !== 'undefined' 
-  ? JSON.parse(__firebase_config) 
-  : { apiKey: "", authDomain: "", projectId: "", storageBucket: "", messagingSenderId: "", appId: "" };
-
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'vacation-checkin-react-v1';
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
+import React, { useState, useEffect } from 'react';
 
 export default function App() {
   // --- 狀態管理 ---
-  const [user, setUser] = useState(null);
   const [currentUserData, setCurrentUserData] = useState(null);
   const [employees, setEmployees] = useState([]);
+  const [checkins, setCheckins] = useState([]);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [viewDate, setViewDate] = useState(new Date());
   const [loading, setLoading] = useState(true);
@@ -51,6 +23,28 @@ export default function App() {
     autoTime: '18:00', 
     lastAutoSentDate: '' 
   });
+
+  // --- 本地儲存邏輯 (替代 Firebase) ---
+  useEffect(() => {
+    // 從 localStorage 初始化資料
+    const savedEmployees = JSON.parse(localStorage.getItem('ems_employees') || '[]');
+    const savedCheckins = JSON.parse(localStorage.getItem('ems_checkins') || '[]');
+    const savedTgConfig = JSON.parse(localStorage.getItem('ems_tg_config') || '{"token":"","chatId":"","autoEnabled":false,"autoTime":"18:00","lastAutoSentDate":""}');
+    
+    setEmployees(savedEmployees);
+    setCheckins(savedCheckins);
+    setTgConfig(savedTgConfig);
+    setLoading(false);
+  }, []);
+
+  // 當資料變動時存入 localStorage
+  useEffect(() => {
+    if (!loading) {
+      localStorage.setItem('ems_employees', JSON.stringify(employees));
+      localStorage.setItem('ems_checkins', JSON.stringify(checkins));
+      localStorage.setItem('ems_tg_config', JSON.stringify(tgConfig));
+    }
+  }, [employees, checkins, tgConfig, loading]);
 
   // --- 通用功能 ---
   const showToast = (message, type = 'info') => {
@@ -76,9 +70,7 @@ export default function App() {
 
   const processReport = async (isAuto = false) => {
     const today = new Date().toLocaleDateString();
-    const checkinsRef = collection(db, 'artifacts', appId, 'public', 'data', 'checkins');
-    const snap = await getDocs(checkinsRef);
-    const todayLog = snap.docs.map(d => d.data()).filter(l => l.dateDisplay === today);
+    const todayLog = checkins.filter(l => l.dateDisplay === today);
     
     const checkedIds = [...new Set(todayLog.map(l => l.employeeId))];
     const missing = employees.filter(e => !checkedIds.includes(e.id));
@@ -89,47 +81,10 @@ export default function App() {
 
     const ok = await sendToTelegram(msg);
     if (ok && isAuto) {
-      const newConfig = { ...tgConfig, lastAutoSentDate: today };
-      setTgConfig(newConfig);
-      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram'), { lastAutoSentDate: today }, { merge: true });
+      setTgConfig(prev => ({ ...prev, lastAutoSentDate: today }));
     }
     return ok;
   };
-
-  // --- 副作用 (Auth & Data) ---
-  useEffect(() => {
-    const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
-        await signInAnonymously(auth);
-      }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    if (!user) return;
-
-    // 監聽員工資料
-    const unsubEmp = onSnapshot(
-      collection(db, 'artifacts', appId, 'public', 'data', 'employees'), 
-      (snap) => {
-        setEmployees(snap.docs.map(d => ({ ...d.data(), id: d.id })));
-        setLoading(false);
-      },
-      (err) => console.error("Firestore Error:", err)
-    );
-
-    // 讀取 TG 設定
-    getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram')).then(snap => {
-      if (snap.exists()) setTgConfig(prev => ({ ...prev, ...snap.data() }));
-    });
-
-    return () => unsubEmp();
-  }, [user]);
 
   // 計時器與自動報表
   useEffect(() => {
@@ -137,7 +92,6 @@ export default function App() {
       const now = new Date();
       setCurrentTime(now);
       
-      // 自動報表檢查 (僅限管理員)
       if (currentUserData?.id === 'ADMIN' && tgConfig.autoEnabled) {
         const timeStr = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
         const dateStr = now.toLocaleDateString();
@@ -147,7 +101,7 @@ export default function App() {
       }
     }, 1000);
     return () => clearInterval(timer);
-  }, [currentUserData, tgConfig, employees]);
+  }, [currentUserData, tgConfig, employees, checkins]);
 
   // --- 處理函式 ---
   const handleLogin = () => {
@@ -155,11 +109,13 @@ export default function App() {
     if (account === 'admin' && password === 'admin') {
       setCurrentUserData({ id: 'ADMIN', name: '系統管理員' });
       setIsLoggedIn(true);
+      showToast('歡迎回來，管理員', 'success');
     } else {
       const found = employees.find(e => e.id === account && e.id === password);
       if (found) {
         setCurrentUserData(found);
         setIsLoggedIn(true);
+        showToast(`歡迎回來，${found.name}`, 'success');
       } else {
         showToast('登入失敗，請檢查工號與密碼', 'error');
       }
@@ -172,96 +128,100 @@ export default function App() {
     const d = now.toLocaleDateString();
     const t = now.toLocaleTimeString();
     
-    try {
-      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'checkins'), {
-        employeeId: currentUserData.id,
-        employeeName: currentUserData.name,
-        dateDisplay: d,
-        timeDisplay: t,
-        timestamp: serverTimestamp()
-      });
-      showToast('打卡成功', 'success');
-      sendToTelegram(`🔔 *打卡通知*\n👤 ${currentUserData.name}\n⏰ ${d} ${t}`);
-    } catch (e) {
-      showToast('打卡失敗', 'error');
-    }
+    const newCheckin = {
+      employeeId: currentUserData.id,
+      employeeName: currentUserData.name,
+      dateDisplay: d,
+      timeDisplay: t,
+      timestamp: Date.now()
+    };
+
+    setCheckins(prev => [...prev, newCheckin]);
+    showToast('打卡成功', 'success');
+    sendToTelegram(`🔔 *打卡通知*\n👤 ${currentUserData.name}\n⏰ ${d} ${t}`);
   };
 
-  const toggleVacation = async (empId, dateStr) => {
-    const emp = employees.find(e => e.id === empId);
-    if (!emp) return;
+  const toggleVacation = (empId, dateStr) => {
     const isAdmin = currentUserData?.id === 'ADMIN';
     const isSelf = currentUserData?.id === empId;
     if (!isAdmin && !isSelf) return;
 
-    const dates = emp.vacationDates || [];
-    const newDates = dates.includes(dateStr) 
-      ? dates.filter(d => d !== dateStr) 
-      : [...dates, dateStr];
-
-    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'employees', empId), { 
-      vacationDates: newDates, 
-      usedVacation: newDates.length 
-    }, { merge: true });
+    setEmployees(prev => prev.map(emp => {
+      if (emp.id === empId) {
+        const dates = emp.vacationDates || [];
+        const newDates = dates.includes(dateStr) 
+          ? dates.filter(d => d !== dateStr) 
+          : [...dates, dateStr];
+        return { ...emp, vacationDates: newDates, usedVacation: newDates.length };
+      }
+      return emp;
+    }));
   };
 
-  const saveEmployee = async () => {
+  const saveEmployee = () => {
     if (!newEmp.id || !newEmp.name) return;
-    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'employees', newEmp.id), { 
+    if (employees.some(e => e.id === newEmp.id)) {
+      showToast('此工號已存在', 'error');
+      return;
+    }
+    const empData = { 
       id: newEmp.id, 
       name: newEmp.name, 
       totalVacation: parseInt(newEmp.vacation), 
       vacationDates: [], 
       usedVacation: 0 
-    });
+    };
+    setEmployees(prev => [...prev, empData]);
     setShowAddModal(false);
     setNewEmp({ id: '', name: '', vacation: 7 });
     showToast('員工新增成功', 'success');
   };
 
-  const saveTgSettings = async () => {
-    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'telegram'), tgConfig);
-    setShowTgModal(false);
-    showToast('Telegram 設定已儲存', 'success');
+  const deleteEmployee = (id) => {
+    if (window.confirm(`確定要刪除員工 ${id} 嗎？此動作不可逆。`)) {
+        setEmployees(prev => prev.filter(e => e.id !== id));
+        showToast('員工已刪除', 'info');
+    }
   };
 
   // --- 渲染組件 ---
-  if (loading) {
-    return (
-      <div className="fixed inset-0 bg-white flex items-center justify-center z-[100]">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-black mx-auto mb-4"></div>
-          <p className="text-gray-500 text-sm">系統載入中...</p>
-        </div>
-      </div>
-    );
-  }
+  if (loading) return null;
 
   if (!isLoggedIn) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
-        <div className="w-full max-w-sm bg-white border shadow-sm rounded-lg p-10">
-          <h1 className="text-2xl font-bold mb-6 text-center text-gray-800">員工登入</h1>
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6 font-sans">
+        <div className="w-full max-w-sm bg-white shadow-xl rounded-2xl p-10 border border-slate-100">
+          <div className="text-center mb-8">
+            <h1 className="text-3xl font-black text-slate-800">員工登入</h1>
+            <p className="text-slate-400 text-sm mt-2">請輸入您的工號與密碼</p>
+          </div>
           <div className="space-y-4">
-            <input 
-              className="w-full border p-3 rounded outline-none focus:ring-2 focus:ring-black/5" 
-              placeholder="工號 (管理員: admin)"
-              value={loginForm.account}
-              onChange={(e) => setLoginForm({...loginForm, account: e.target.value})}
-            />
-            <input 
-              className="w-full border p-3 rounded outline-none focus:ring-2 focus:ring-black/5" 
-              type="password" 
-              placeholder="密碼 (預設同工號)"
-              value={loginForm.password}
-              onChange={(e) => setLoginForm({...loginForm, password: e.target.value})}
-            />
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-500 uppercase ml-1">Account</label>
+              <input 
+                className="w-full border-slate-200 border p-3 rounded-xl outline-none focus:ring-2 focus:ring-slate-900/5 transition-all" 
+                placeholder="工號 (管理員: admin)"
+                value={loginForm.account}
+                onChange={(e) => setLoginForm({...loginForm, account: e.target.value})}
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-500 uppercase ml-1">Password</label>
+              <input 
+                className="w-full border-slate-200 border p-3 rounded-xl outline-none focus:ring-2 focus:ring-slate-900/5 transition-all" 
+                type="password" 
+                placeholder="密碼 (預設同工號)"
+                value={loginForm.password}
+                onChange={(e) => setLoginForm({...loginForm, password: e.target.value})}
+              />
+            </div>
             <button 
               onClick={handleLogin}
-              className="w-full bg-black text-white p-3 font-bold rounded hover:opacity-90 transition-opacity"
+              className="w-full bg-slate-900 text-white p-4 font-bold rounded-xl hover:bg-slate-800 active:scale-[0.98] transition-all shadow-lg shadow-slate-200 mt-4"
             >
               進入系統
             </button>
+            <p className="text-[10px] text-center text-slate-400 mt-4 italic">此版本使用瀏覽器 LocalStorage 儲存資料</p>
           </div>
         </div>
       </div>
@@ -274,11 +234,11 @@ export default function App() {
   const daysInMonth = new Date(year, month + 1, 0).getDate();
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans pb-20">
       {/* Toast */}
-      <div className="fixed bottom-6 right-6 z-[200] flex flex-col gap-2 pointer-events-none">
+      <div className="fixed top-6 right-6 z-[200] flex flex-col gap-2 pointer-events-none">
         {toasts.map(t => (
-          <div key={t.id} className={`${t.type === 'success' ? 'bg-green-600' : t.type === 'error' ? 'bg-red-500' : 'bg-gray-800'} px-4 py-3 rounded-lg shadow-xl text-white text-sm font-medium animate-bounce`}>
+          <div key={t.id} className={`${t.type === 'success' ? 'bg-emerald-500' : t.type === 'error' ? 'bg-rose-500' : 'bg-slate-800'} px-6 py-3 rounded-full shadow-2xl text-white text-sm font-bold animate-slide-in`}>
             {t.message}
           </div>
         ))}
@@ -287,177 +247,230 @@ export default function App() {
       {/* Header */}
       <header 
         onClick={handleCheckin}
-        className="w-full p-6 text-center border-b bg-white transition-all hover:bg-blue-50 cursor-pointer active:bg-blue-100 group"
+        className="w-full p-8 text-center border-b bg-white transition-all hover:bg-slate-50 cursor-pointer active:bg-slate-100 group sticky top-0 z-40"
       >
-        <div className="text-xs text-gray-400 uppercase tracking-widest mb-1">System Time</div>
-        <div className="text-4xl font-mono font-bold group-hover:text-blue-600 transition-colors">
-          {currentTime.toLocaleString()}
+        <div className="text-[10px] text-slate-400 uppercase tracking-[0.3em] font-black mb-1">Live Server Time</div>
+        <div className="text-4xl font-mono font-black group-hover:tracking-wider transition-all duration-500">
+          {currentTime.toLocaleTimeString()}
         </div>
         {!isAdmin && (
-          <div className="text-sm text-blue-500 mt-2 font-medium flex items-center justify-center gap-2">
-            <span className="animate-pulse">👆</span> 點擊此區域立即打卡 (將自動回報至 TG)
+          <div className="text-xs text-blue-500 mt-2 font-bold flex items-center justify-center gap-2">
+            <span className="animate-bounce">👇</span> 點擊此橫幅區域立即打卡
           </div>
         )}
       </header>
 
       {/* Main Content */}
-      <main className="max-w-6xl mx-auto p-6">
-        <div className="flex flex-col md:flex-row justify-between items-center md:items-end mb-8 border-b pb-4 gap-4">
-          <div>
-            <p className="text-sm text-gray-500 font-medium bg-gray-100 px-3 py-1 rounded-full">
-              登入者: {currentUserData.name}
-            </p>
+      <main className="max-w-6xl mx-auto p-6 mt-4">
+        <div className="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 bg-slate-900 rounded-2xl flex items-center justify-center text-white font-black">
+              {currentUserData.name[0]}
+            </div>
+            <div>
+              <h2 className="font-black text-xl">{currentUserData.name}</h2>
+              <p className="text-xs text-slate-400 font-bold uppercase tracking-widest">{isAdmin ? 'Administrator' : `Employee ID: ${currentUserData.id}`}</p>
+            </div>
           </div>
-          <div className="flex gap-4 items-center flex-wrap justify-center">
+          
+          <div className="flex gap-3 items-center flex-wrap justify-center">
             {isAdmin && (
-              <div className="flex gap-2 mr-4 border-r pr-4">
-                <button onClick={() => setShowTgModal(true)} className="text-sm border-gray-300 border px-3 py-1.5 rounded hover:bg-gray-100 flex items-center gap-1">
-                  ⚙️ TG 設定
-                </button>
-                <button onClick={() => processReport(false)} className="text-sm bg-[#0088cc] text-white px-3 py-1.5 rounded hover:bg-[#0077b3] flex items-center gap-1">
-                  📢 手動報表
-                </button>
+              <div className="flex gap-2 mr-2 border-r border-slate-200 pr-4">
+                <button onClick={() => setShowTgModal(true)} className="p-2 rounded-xl bg-white border border-slate-200 hover:border-slate-900 transition-all text-lg shadow-sm">⚙️</button>
+                <button onClick={() => processReport(false)} className="px-4 py-2 bg-sky-500 text-white rounded-xl hover:bg-sky-600 font-bold text-sm transition-all shadow-lg shadow-sky-100">發送總結</button>
               </div>
             )}
-            <div className="flex border rounded overflow-hidden bg-white shadow-sm">
-              <button onClick={() => setViewDate(new Date(year, month - 1))} className="px-3 py-1 hover:bg-gray-50">&lt;</button>
-              <div className="px-4 py-1 font-medium min-w-[120px] text-center">{year} / {month + 1}</div>
-              <button onClick={() => setViewDate(new Date(year, month + 1))} className="px-3 py-1 hover:bg-gray-50">&gt;</button>
+            <div className="flex border border-slate-200 rounded-xl overflow-hidden bg-white shadow-sm font-bold">
+              <button onClick={() => setViewDate(new Date(year, month - 1))} className="px-4 py-2 hover:bg-slate-50">←</button>
+              <div className="px-6 py-2 bg-slate-50 min-w-[140px] text-center">{year} / {month + 1}</div>
+              <button onClick={() => setViewDate(new Date(year, month + 1))} className="px-4 py-2 hover:bg-slate-50">→</button>
             </div>
-            <button onClick={() => setIsLoggedIn(false)} className="text-sm font-bold text-red-500 hover:text-red-700 bg-red-50 px-3 py-1 rounded">登出</button>
+            <button onClick={() => setIsLoggedIn(false)} className="px-4 py-2 font-bold text-rose-500 bg-white border border-rose-100 rounded-xl hover:bg-rose-500 hover:text-white transition-all">登出</button>
           </div>
         </div>
 
-        <div className="space-y-4">
-          <div className="flex justify-between items-center">
-            <h2 className="text-lg font-bold">員工休假概況表</h2>
+        <div className="bg-white rounded-[2rem] shadow-sm border border-slate-100 overflow-hidden">
+          <div className="p-8 flex justify-between items-center border-b border-slate-50 bg-slate-50/30">
+            <h3 className="text-lg font-black text-slate-800">員工休假狀態概覽</h3>
             {isAdmin && (
-              <button onClick={() => setShowAddModal(true)} className="text-sm border-black border px-4 py-1.5 rounded hover:bg-black hover:text-white transition-all shadow-sm">
+              <button onClick={() => setShowAddModal(true)} className="bg-slate-900 text-white px-6 py-2 rounded-xl font-bold text-sm hover:scale-105 transition-all shadow-xl shadow-slate-200">
                 + 新增員工
               </button>
             )}
           </div>
           
-          <div className="overflow-x-auto border bg-white rounded-lg shadow-sm">
-            <table className="w-full text-left border-collapse min-w-[800px]">
-              <thead className="bg-gray-50 text-xs text-gray-500 uppercase">
-                <tr>
-                  <th className="p-4 border-b w-48">員工姓名 / 工號</th>
-                  <th className="p-4 border-b text-center w-32">已休 / 總額</th>
-                  <th className="p-4 border-b">本月休假預覽 (點擊日期可修改假別)</th>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                  <th className="p-6 border-b border-slate-50">姓名 / 工號</th>
+                  <th className="p-6 border-b border-slate-50 text-center">假額狀態</th>
+                  <th className="p-6 border-b border-slate-50">本月日曆 (點擊日期標註休假)</th>
+                  {isAdmin && <th className="p-6 border-b border-slate-50 text-right">操作</th>}
                 </tr>
               </thead>
-              <tbody className="divide-y text-sm">
-                {employees.map(emp => {
-                  const isSelf = emp.id === currentUserData.id;
-                  const canEdit = isAdmin || isSelf;
-                  return (
-                    <tr key={emp.id}>
-                      <td className="p-4 font-medium">{emp.name} <span className="text-xs text-gray-400">#{emp.id}</span></td>
-                      <td className="p-4 text-center">
-                        <span className={emp.usedVacation >= emp.totalVacation ? 'text-red-500 font-bold' : ''}>
-                          {emp.usedVacation || 0}
-                        </span> / {emp.totalVacation}
-                      </td>
-                      <td className="p-2">
-                        <div className="flex gap-1 overflow-x-auto p-1">
-                          {Array.from({ length: daysInMonth }, (_, i) => i + 1).map(day => {
-                            const dateStr = `${year}-${month + 1}-${day}`;
-                            const isLeaved = emp.vacationDates?.includes(dateStr);
-                            return (
-                              <button 
-                                key={day}
-                                onClick={() => toggleVacation(emp.id, dateStr)}
-                                disabled={!canEdit}
-                                className={`w-8 h-8 flex-shrink-0 text-[10px] rounded border transition-all 
-                                  ${isLeaved ? 'bg-red-500 text-white border-red-600' : 'bg-gray-50 hover:bg-gray-200'} 
-                                  ${!canEdit ? 'opacity-50 cursor-not-allowed' : ''}`}
-                              >
-                                {day}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
+              <tbody className="divide-y divide-slate-50">
+                {employees.length === 0 ? (
+                  <tr>
+                    <td colSpan="4" className="p-20 text-center text-slate-300 italic font-bold">目前無員工資料，請點擊新增。</td>
+                  </tr>
+                ) : (
+                  employees.map(emp => {
+                    const isSelf = emp.id === currentUserData.id;
+                    const canEdit = isAdmin || isSelf;
+                    return (
+                      <tr key={emp.id} className="hover:bg-slate-50/50 transition-colors">
+                        <td className="p-6">
+                          <div className="font-black text-slate-800">{emp.name}</div>
+                          <div className="text-[10px] font-bold text-slate-400">ID: {emp.id}</div>
+                        </td>
+                        <td className="p-6 text-center">
+                          <div className={`text-lg font-black ${emp.usedVacation >= emp.totalVacation ? 'text-rose-500' : 'text-slate-800'}`}>
+                            {emp.usedVacation || 0} <span className="text-xs text-slate-300 font-normal">/ {emp.totalVacation}</span>
+                          </div>
+                          <div className="w-20 h-1 bg-slate-100 rounded-full mx-auto mt-2 overflow-hidden">
+                            <div 
+                              className={`h-full transition-all duration-500 ${emp.usedVacation >= emp.totalVacation ? 'bg-rose-500' : 'bg-emerald-500'}`}
+                              style={{ width: `${Math.min((emp.usedVacation / emp.totalVacation) * 100, 100)}%` }}
+                            />
+                          </div>
+                        </td>
+                        <td className="p-6">
+                          <div className="flex gap-1 overflow-x-auto pb-2 no-scrollbar">
+                            {Array.from({ length: daysInMonth }, (_, i) => i + 1).map(day => {
+                              const dateStr = `${year}-${month + 1}-${day}`;
+                              const isLeaved = emp.vacationDates?.includes(dateStr);
+                              return (
+                                <button 
+                                  key={day}
+                                  onClick={() => toggleVacation(emp.id, dateStr)}
+                                  disabled={!canEdit}
+                                  className={`w-8 h-8 flex-shrink-0 text-[10px] font-bold rounded-lg border transition-all 
+                                    ${isLeaved ? 'bg-rose-500 text-white border-rose-600 shadow-lg shadow-rose-100' : 'bg-white text-slate-400 border-slate-100 hover:border-slate-300'} 
+                                    ${!canEdit ? 'opacity-30 cursor-not-allowed' : 'active:scale-90'}`}
+                                >
+                                  {day}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </td>
+                        {isAdmin && (
+                          <td className="p-6 text-right">
+                            <button 
+                              onClick={() => deleteEmployee(emp.id)}
+                              className="text-slate-300 hover:text-rose-500 transition-colors p-2"
+                            >
+                              🗑️
+                            </button>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })
+                )}
               </tbody>
             </table>
           </div>
-          
-          {!isAdmin && (
-            <div className="mt-4 p-4 bg-blue-50 text-blue-700 text-xs rounded-lg border border-blue-100">
-              <strong>操作提示：</strong> 您可以在上方表格中找到您的姓名列，點擊對應日期方格即可申請或取消休假。
-            </div>
-          )}
         </div>
+
+        {!isAdmin && (
+          <div className="mt-8 p-6 bg-slate-900 text-white rounded-3xl shadow-2xl flex items-center gap-6">
+            <div className="text-3xl">💡</div>
+            <div>
+              <p className="font-bold">操作提示</p>
+              <p className="text-xs text-slate-400 mt-1">您可以點擊頂部時間區域進行每日打卡，或在表格中點擊日期來標註您的休假計畫。</p>
+            </div>
+          </div>
+        )}
       </main>
 
       {/* Modals */}
       {showAddModal && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-white p-8 w-full max-w-md shadow-2xl rounded-lg">
-            <h3 className="text-xl font-bold mb-6">新增員工帳號</h3>
-            <div className="space-y-5">
-              <div>
-                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">工號</label>
-                <input value={newEmp.id} onChange={e => setNewEmp({...newEmp, id: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-black" placeholder="例: EMP001" />
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md flex items-center justify-center z-50 p-6">
+          <div className="bg-white p-10 w-full max-w-md shadow-2xl rounded-[2.5rem] animate-pop-in">
+            <h3 className="text-2xl font-black mb-2 text-slate-800">新增員工</h3>
+            <p className="text-slate-400 text-sm mb-8">建立新的員工帳號與初始休假額度。</p>
+            <div className="space-y-6">
+              <div className="space-y-1">
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Employee ID</label>
+                <input value={newEmp.id} onChange={e => setNewEmp({...newEmp, id: e.target.value})} className="w-full border-slate-200 border rounded-2xl p-4 outline-none focus:ring-4 focus:ring-slate-900/5" placeholder="例: EMP101" />
               </div>
-              <div>
-                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">姓名</label>
-                <input value={newEmp.name} onChange={e => setNewEmp({...newEmp, name: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-black" placeholder="例: 王小明" />
+              <div className="space-y-1">
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Full Name</label>
+                <input value={newEmp.name} onChange={e => setNewEmp({...newEmp, name: e.target.value})} className="w-full border-slate-200 border rounded-2xl p-4 outline-none focus:ring-4 focus:ring-slate-900/5" placeholder="例: 陳大文" />
               </div>
-              <div>
-                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">年度特休天數</label>
-                <input type="number" value={newEmp.vacation} onChange={e => setNewEmp({...newEmp, vacation: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-black" />
+              <div className="space-y-1">
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Annual Leave Days</label>
+                <input type="number" value={newEmp.vacation} onChange={e => setNewEmp({...newEmp, vacation: e.target.value})} className="w-full border-slate-200 border rounded-2xl p-4 outline-none focus:ring-4 focus:ring-slate-900/5" />
               </div>
             </div>
-            <div className="flex gap-3 mt-10">
-              <button onClick={() => setShowAddModal(false)} className="flex-1 border p-3 text-sm font-bold rounded hover:bg-gray-50">取消</button>
-              <button onClick={saveEmployee} className="flex-1 bg-black text-white p-3 text-sm font-bold rounded hover:bg-black/90">儲存資料</button>
+            <div className="flex gap-4 mt-10">
+              <button onClick={() => setShowAddModal(false)} className="flex-1 py-4 text-sm font-black text-slate-400 rounded-2xl hover:bg-slate-50">取消</button>
+              <button onClick={saveEmployee} className="flex-1 bg-slate-900 text-white py-4 text-sm font-black rounded-2xl hover:bg-slate-800 shadow-xl shadow-slate-200">完成新增</button>
             </div>
           </div>
         </div>
       )}
 
       {showTgModal && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-white p-8 w-full max-w-md shadow-2xl rounded-lg border-t-4 border-[#0088cc] max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center gap-2 mb-6">
-              <span className="text-2xl">⚙️</span>
-              <h3 className="text-xl font-bold">Telegram 機器人設定</h3>
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md flex items-center justify-center z-50 p-6">
+          <div className="bg-white p-10 w-full max-w-md shadow-2xl rounded-[2.5rem] border-t-8 border-sky-500 animate-pop-in">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="w-10 h-10 bg-sky-100 rounded-full flex items-center justify-center text-xl text-sky-500">✈️</div>
+              <h3 className="text-2xl font-black text-slate-800">Telegram Bot</h3>
             </div>
-            <div className="space-y-5">
-              <div className="p-3 bg-blue-50 text-blue-800 text-xs rounded border border-blue-100">
-                打卡將自動即時推播。您也可以啟用自動報表功能。
+            <div className="space-y-6">
+              <div className="p-4 bg-sky-50 text-sky-700 text-[10px] rounded-2xl font-bold leading-relaxed">
+                系統將在打卡發生時即時推送通知至您的頻道。您可以選用「每日總結」功能。
               </div>
-              <div>
-                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">Bot Token</label>
-                <input value={tgConfig.token} onChange={e => setTgConfig({...tgConfig, token: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-[#0088cc]" placeholder="12345678:AA..." />
+              <div className="space-y-1">
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Bot Token</label>
+                <input value={tgConfig.token} onChange={e => setTgConfig({...tgConfig, token: e.target.value})} className="w-full border-slate-200 border rounded-2xl p-4 outline-none focus:border-sky-500" placeholder="123456:AA..." />
               </div>
-              <div>
-                <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">Chat ID</label>
-                <input value={tgConfig.chatid} onChange={e => setTgConfig({...tgConfig, chatId: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-[#0088cc]" placeholder="-100..." />
+              <div className="space-y-1">
+                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Chat ID</label>
+                <input value={tgConfig.chatId} onChange={e => setTgConfig({...tgConfig, chatId: e.target.value})} className="w-full border-slate-200 border rounded-2xl p-4 outline-none focus:border-sky-500" placeholder="-100..." />
               </div>
-              <div className="border-t pt-4 mt-4">
-                <label className="flex items-center gap-2 cursor-pointer mb-3">
-                  <input type="checkbox" checked={tgConfig.autoEnabled} onChange={e => setTgConfig({...tgConfig, autoEnabled: e.target.checked})} className="w-4 h-4 text-[#0088cc] rounded" />
-                  <span className="text-sm font-bold">啟用每日自動總結報表</span>
+              <div className="pt-4 border-t border-slate-100">
+                <label className="flex items-center gap-3 cursor-pointer group">
+                  <input 
+                    type="checkbox" 
+                    checked={tgConfig.autoEnabled} 
+                    onChange={e => setTgConfig({...tgConfig, autoEnabled: e.target.checked})} 
+                    className="w-5 h-5 accent-sky-500 rounded-lg" 
+                  />
+                  <span className="text-sm font-black text-slate-700">啟用定時自動總結報告</span>
                 </label>
-                <div className={tgConfig.autoEnabled ? '' : 'opacity-50'}>
-                  <label className="text-xs font-bold text-gray-500 block mb-1 uppercase tracking-wider">自動發送時間</label>
-                  <input type="time" disabled={!tgConfig.autoEnabled} value={tgConfig.autoTime} onChange={e => setTgConfig({...tgConfig, autoTime: e.target.value})} className="w-full border rounded p-3 outline-none focus:border-[#0088cc]" />
-                </div>
+                {tgConfig.autoEnabled && (
+                  <div className="mt-4 animate-slide-down">
+                    <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">發送時間 (24h)</label>
+                    <input type="time" value={tgConfig.autoTime} onChange={e => setTgConfig({...tgConfig, autoTime: e.target.value})} className="w-full border-slate-200 border rounded-2xl p-4 mt-1 outline-none focus:border-sky-500" />
+                  </div>
+                )}
               </div>
             </div>
-            <div className="flex gap-3 mt-8">
-              <button onClick={() => setShowTgModal(false)} className="flex-1 border p-3 text-sm font-bold rounded hover:bg-gray-50">取消</button>
-              <button onClick={saveTgSettings} className="flex-1 bg-[#0088cc] text-white p-3 text-sm font-bold rounded hover:bg-[#0077b3]">儲存設定</button>
+            <div className="flex gap-4 mt-8">
+              <button onClick={() => setShowTgModal(false)} className="flex-1 py-4 text-sm font-black text-slate-400">取消</button>
+              <button onClick={() => {setShowTgModal(false); showToast('設定已更新', 'success');}} className="flex-1 bg-sky-500 text-white py-4 text-sm font-black rounded-2xl hover:bg-sky-600 shadow-xl shadow-sky-100">儲存設定</button>
             </div>
           </div>
         </div>
       )}
+
+      <style dangerouslySetInnerHTML={{ __html: `
+        @keyframes pop-in {
+          0% { transform: scale(0.95); opacity: 0; }
+          100% { transform: scale(1); opacity: 1; }
+        }
+        @keyframes slide-in {
+          0% { transform: translateX(20px); opacity: 0; }
+          100% { transform: translateX(0); opacity: 1; }
+        }
+        .animate-pop-in { animation: pop-in 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        .animate-slide-in { animation: slide-in 0.3s ease-out; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+      `}} />
     </div>
   );
 }
